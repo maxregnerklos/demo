@@ -16,7 +16,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v2
       with:
-        python-version: '3.8'
+        python-version: '3.10'
 
     - name: Install dependencies
       run: |
@@ -26,12 +26,18 @@ jobs:
         pip install bitsandbytes sentencepiece
         pip install beautifulsoup4 requests
 
-    - name: Download LLaMA model
+    - name: Setup Hugging Face CLI
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
       run: |
         pip install huggingface_hub
+        huggingface-cli login --token $HF_TOKEN
+
+    - name: Download Llama 3 model
+      run: |
         python -c "
         from huggingface_hub import snapshot_download
-        snapshot_download(repo_id='decapoda-research/llama-7b-hf', local_dir='./llama-7b-hf')
+        snapshot_download(repo_id='meta-llama/Meta-Llama-3.1-8B-Instruct', local_dir='./llama-3-8b-instruct')
         "
 
     - name: Prepare internet dataset
@@ -41,7 +47,6 @@ jobs:
         from bs4 import BeautifulSoup
         import random
 
-        # List of programming-related websites
         websites = [
             'https://stackoverflow.com',
             'https://github.com',
@@ -57,9 +62,8 @@ jobs:
             paragraphs = soup.find_all('p')
             data.extend([p.text for p in paragraphs if len(p.text.split()) > 10])
 
-        # Shuffle and select a subset of the data
         random.shuffle(data)
-        selected_data = data[:1000]  # Adjust this number based on your needs
+        selected_data = data[:1000]
 
         with open('internet_data.txt', 'w', encoding='utf-8') as f:
             for item in selected_data:
@@ -75,14 +79,12 @@ jobs:
         import torch
         import time
 
-        # Load model and tokenizer
-        model = AutoModelForCausalLM.from_pretrained('./llama-7b-hf', load_in_8bit=True, device_map='auto')
+        model = AutoModelForCausalLM.from_pretrained('./llama-3-8b-instruct', load_in_8bit=True, device_map='auto')
         model = prepare_model_for_int8_training(model)
 
-        tokenizer = AutoTokenizer.from_pretrained('./llama-7b-hf')
+        tokenizer = AutoTokenizer.from_pretrained('./llama-3-8b-instruct')
         tokenizer.pad_token = tokenizer.eos_token
 
-        # Prepare LoRA configuration
         lora_config = LoraConfig(
             r=16,
             lora_alpha=32,
@@ -92,19 +94,15 @@ jobs:
             task_type='CAUSAL_LM'
         )
 
-        # Wrap the model with LoRA
         model = get_peft_model(model, lora_config)
 
-        # Load dataset
         dataset = load_dataset('text', data_files={'train': 'internet_data.txt'})
 
-        # Tokenize dataset
         def tokenize_function(examples):
             return tokenizer(examples['text'], truncation=True, padding='max_length', max_length=512)
 
         tokenized_datasets = dataset.map(tokenize_function, batched=True, num_proc=4, remove_columns=['text'])
 
-        # Set up training arguments
         training_args = TrainingArguments(
             output_dir='./results',
             num_train_epochs=1,
@@ -116,7 +114,6 @@ jobs:
             learning_rate=3e-4,
         )
 
-        # Initialize Trainer
         trainer = Trainer(
             model=model,
             args=training_args,
@@ -124,12 +121,10 @@ jobs:
             data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
         )
 
-        # Train the model for 5 minutes
         start_time = time.time()
         while time.time() - start_time < 300:  # 300 seconds = 5 minutes
             trainer.train()
 
-        # Save the model
         trainer.save_model('./fine_tuned_model')
         "
 
@@ -138,4 +133,3 @@ jobs:
       with:
         name: fine-tuned-llm
         path: ./fine_tuned_model
-
