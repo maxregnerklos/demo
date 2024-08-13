@@ -1,0 +1,141 @@
+name: Train and Upload LLM
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  train-and-upload:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.8'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch transformers datasets accelerate
+        pip install git+https://github.com/huggingface/peft.git
+        pip install bitsandbytes sentencepiece
+        pip install beautifulsoup4 requests
+
+    - name: Download LLaMA model
+      run: |
+        pip install huggingface_hub
+        python -c "
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id='decapoda-research/llama-7b-hf', local_dir='./llama-7b-hf')
+        "
+
+    - name: Prepare internet dataset
+      run: |
+        python -c "
+        import requests
+        from bs4 import BeautifulSoup
+        import random
+
+        # List of programming-related websites
+        websites = [
+            'https://stackoverflow.com',
+            'https://github.com',
+            'https://dev.to',
+            'https://www.freecodecamp.org'
+        ]
+
+        data = []
+
+        for site in websites:
+            response = requests.get(site)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            paragraphs = soup.find_all('p')
+            data.extend([p.text for p in paragraphs if len(p.text.split()) > 10])
+
+        # Shuffle and select a subset of the data
+        random.shuffle(data)
+        selected_data = data[:1000]  # Adjust this number based on your needs
+
+        with open('internet_data.txt', 'w', encoding='utf-8') as f:
+            for item in selected_data:
+                f.write(f'{item}\n')
+        "
+
+    - name: Fine-tune model
+      run: |
+        python -c "
+        from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+        from datasets import load_dataset
+        from peft import prepare_model_for_int8_training, LoraConfig, get_peft_model
+        import torch
+        import time
+
+        # Load model and tokenizer
+        model = AutoModelForCausalLM.from_pretrained('./llama-7b-hf', load_in_8bit=True, device_map='auto')
+        model = prepare_model_for_int8_training(model)
+
+        tokenizer = AutoTokenizer.from_pretrained('./llama-7b-hf')
+        tokenizer.pad_token = tokenizer.eos_token
+
+        # Prepare LoRA configuration
+        lora_config = LoraConfig(
+            r=16,
+            lora_alpha=32,
+            target_modules=['q_proj', 'v_proj'],
+            lora_dropout=0.05,
+            bias='none',
+            task_type='CAUSAL_LM'
+        )
+
+        # Wrap the model with LoRA
+        model = get_peft_model(model, lora_config)
+
+        # Load dataset
+        dataset = load_dataset('text', data_files={'train': 'internet_data.txt'})
+
+        # Tokenize dataset
+        def tokenize_function(examples):
+            return tokenizer(examples['text'], truncation=True, padding='max_length', max_length=512)
+
+        tokenized_datasets = dataset.map(tokenize_function, batched=True, num_proc=4, remove_columns=['text'])
+
+        # Set up training arguments
+        training_args = TrainingArguments(
+            output_dir='./results',
+            num_train_epochs=1,
+            per_device_train_batch_size=4,
+            gradient_accumulation_steps=4,
+            warmup_steps=100,
+            logging_steps=10,
+            save_strategy='no',
+            learning_rate=3e-4,
+        )
+
+        # Initialize Trainer
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_datasets['train'],
+            data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+        )
+
+        # Train the model for 5 minutes
+        start_time = time.time()
+        while time.time() - start_time < 300:  # 300 seconds = 5 minutes
+            trainer.train()
+
+        # Save the model
+        trainer.save_model('./fine_tuned_model')
+        "
+
+    - name: Upload model as artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: fine-tuned-llm
+        path: ./fine_tuned_model
+
